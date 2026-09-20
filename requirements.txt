@@ -1,4 +1,5 @@
 firebase-admin
 requests
 beautifulsoup4
+lxml
 python-dotenv
