@@ -26,12 +26,19 @@ jobs:
           pip install -r requirements.txt
 
       - name: Create Firebase credentials
+        shell: bash
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
         run: |
           printf '%s' "$FIREBASE_SERVICE_ACCOUNT" > firebase-service-account.json
 
-      - name: Run daily attendance
+      - name: Enqueue today's daily jobs
+        env:
+          FIREBASE_SERVICE_ACCOUNT: firebase-service-account.json
+        run: |
+          python worker.py enqueue-daily
+
+      - name: Process daily attendance
         env:
           FIREBASE_SERVICE_ACCOUNT: firebase-service-account.json
         run: |
