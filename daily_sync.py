@@ -15,6 +15,28 @@ Important:
 
     If attendance/{date} already exists for a student,
     SCCE is NOT contacted again for that student/date.
+
+RELIABILITY FIX (surgical):
+    run_daily_sync() previously had a bare `try / finally` around the
+    scrape-and-save section, with NO `except` clause. Any ScraperError,
+    ValidationError, LoginError, or FirebaseError raised while
+    scraping/saving propagated straight out of this function, up
+    through worker.cmd_queue()'s loop, and crashed the whole worker
+    process -- which is exactly what stopped the queue at student A9.
+
+    The fix below adds explicit except clauses. Every failure now:
+        - is logged with enough context to tell apart a scraper
+          problem (bad response, expired session, validation
+          rejection -- this covers "no records" / NO_CLASS-shaped
+          responses too) from a Firestore/system problem,
+        - finishes the job as FAILED using the EXISTING job schema
+          (status/lastError fields already present on jobs/{jobId}),
+        - and RETURNS a result dict instead of raising, so the caller
+          (worker.cmd_queue) can move on to the next student.
+
+    No other behavior in this function was changed: the Firestore-
+    first check, job claiming, checkpoint updates, and attendance
+    save logic are byte-for-byte the same as before.
 """
 
 from __future__ import annotations
@@ -86,6 +108,10 @@ def check_date_available(
     Returns:
         True  -> date exists in SCCE selector
         False -> date is not offered
+
+    NOTE: this function is unchanged. What changed is how its
+    result is *used* in worker.cmd_enqueue_daily() -- see that
+    function's docstring for Problem 2.
     """
 
     hall_ticket = hall_ticket.strip().upper()
@@ -164,6 +190,13 @@ def run_daily_sync(
         Move to next queue job
 
     This prevents already-scraped students from being scraped again.
+
+    Failure isolation (fix):
+
+        Any failure while scraping/saving THIS student/date now
+        finishes the job as FAILED and returns a result dict. It
+        never raises past this function, so one student's failure
+        can never stop the rest of the queue from being processed.
     """
 
     worker_id = worker_id or config.WORKER_ID
@@ -469,9 +502,96 @@ def run_daily_sync(
 
     # ========================================================
     # EXPECTED FAILURES
+    #
+    # SCRAPER_FAILURE: the SCCE request/session/parsing failed,
+    # OR the result was structurally parseable but failed our
+    # trust check (sync_common.validate_scraped_result) -- this
+    # is also where a "no records" / NO_CLASS-shaped response
+    # ends up, as ValidationError.
+    #
+    # This is distinct from a SYSTEM_FAILURE (Firestore itself
+    # failing), handled in the block below it.
+    #
+    # Either way: this student/date attempt is marked FAILED and
+    # we return -- we do NOT raise, so the rest of the queue is
+    # never affected by this one student.
     # ========================================================
 
-    
+    except (LoginError, ScraperError, ValidationError) as exc:
+
+        logger.warning(
+            "DAILY_SCRAPE_FAILED "
+            "hall=%s date=%s job=%s error=%s",
+            hall_ticket,
+            target_date,
+            job_id,
+            exc,
+        )
+
+        try:
+
+            firestore_repo.finish_job(
+                job_id,
+                "FAILED",
+                error=str(exc),
+            )
+
+        except FirebaseError as finalize_exc:
+
+            logger.warning(
+                "FAILED_FINALIZE_FAILED job=%s error=%s",
+                job_id,
+                finalize_exc,
+            )
+
+        return {
+            "claimed": True,
+            "job_id": job_id,
+            "hallTicket": hall_ticket,
+            "date": target_date,
+            "status": "FAILED",
+            "skipped": False,
+            "error": str(exc),
+        }
+
+    # ========================================================
+    # SYSTEM_FAILURE: Firestore itself failed while saving the
+    # already-successfully-scraped result or updating
+    # checkpoints. Logged/finished the same way, kept as a
+    # separate branch so logs clearly distinguish "SCCE problem"
+    # from "our own database problem".
+    # ========================================================
+
+    except FirebaseError as exc:
+
+        logger.exception(
+            "DAILY_SYSTEM_FAILURE "
+            "job=%s hall=%s date=%s",
+            job_id,
+            hall_ticket,
+            target_date,
+        )
+
+        try:
+
+            firestore_repo.finish_job(
+                job_id,
+                "FAILED",
+                error=str(exc),
+            )
+
+        except FirebaseError:
+            pass
+
+        return {
+            "claimed": True,
+            "job_id": job_id,
+            "hallTicket": hall_ticket,
+            "date": target_date,
+            "status": "FAILED",
+            "skipped": False,
+            "error": str(exc),
+        }
 
     finally:
 
@@ -500,6 +620,10 @@ def enqueue_daily_jobs_for_all_students(
         It does NOT scrape SCCE.
 
     The worker queue later processes those jobs.
+
+    (Unchanged -- this helper was already unconditional over all
+    active students; the buggy single-probe gate that Problem 2
+    describes lived in worker.cmd_enqueue_daily(), not here.)
     """
 
     target_date = target_date or get_ist_today()

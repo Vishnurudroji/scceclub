@@ -26,14 +26,16 @@ Commands:
         Find all ACTIVE registered students.
 
         1. If no students -> STOP.
-        2. Check date availability using ONE student.
-        3. If unavailable -> store NOT_AVAILABLE and STOP.
-        4. If available -> create DAILY_SYNC jobs for all students.
+        2. Probe date availability using ONE student (informational
+           only -- see cmd_enqueue_daily docstring for Problem 2).
+        3. Create DAILY_SYNC jobs for ALL active students regardless
+           of the probe result.
 
 
     python worker.py queue --type DAILY_SYNC --limit 100
 
-        Process eligible jobs sequentially.
+        Process eligible jobs, each fully isolated from the others,
+        with bounded concurrency.
 
         DAILY_SYNC:
             - NOT_AVAILABLE date -> skip
@@ -42,12 +44,60 @@ Commands:
 
         INITIAL_SYNC:
             - historical attendance sync
+
+RELIABILITY FIX (surgical) -- summary of what changed in this file:
+
+    Problem 1 (one student's failure crashed the whole queue):
+        cmd_queue() used to call historical_sync.run_historical_sync()
+        / daily_sync.run_daily_sync() directly inside its loop with no
+        exception handling of its own. Combined with the missing
+        except clause that used to be in daily_sync.run_daily_sync()
+        (fixed separately in daily_sync.py), an exception for one
+        student propagated all the way to main() and crashed the
+        process, so students queued after the failing one were never
+        processed.
+
+        Fix: job dispatch was extracted into _run_single_job(), which
+        wraps EVERYTHING in try/except Exception and always returns a
+        result dict -- it never raises. cmd_queue() now runs jobs
+        through a small bounded thread pool so a genuine exception in
+        one job's thread cannot affect any other job's thread.
+
+    Problem 2 (one probe student's "no class" blocked every other
+    student for that date):
+        cmd_enqueue_daily() used to check availability using only
+        students[0], and on a negative result would write a global
+        daily_status/{date} = NOT_AVAILABLE document and return
+        immediately -- never creating jobs for anyone else. It also
+        short-circuited on any pre-existing NOT_AVAILABLE status.
+
+        Fix: the probe is now informational only. A positive probe is
+        still recorded (harmless, since it never blocks anything). A
+        negative probe (or a probe that itself errors) is logged but
+        no longer written as NOT_AVAILABLE and no longer prevents job
+        creation -- DAILY_SYNC jobs are always created for every
+        active student. Each student's own job independently
+        discovers, via the existing Firestore-first check and scrape
+        in daily_sync.run_daily_sync(), whether SCCE has attendance
+        for THAT student on that date.
+
+    Problems 3/4 (scaling + retry):
+        Retry-with-backoff already existed in sync_common.py and is
+        untouched. cmd_queue() now bounds how many jobs run at once
+        via a small ThreadPoolExecutor, sized from
+        config.MAX_CONCURRENT_SCRAPES when that setting exists,
+        otherwise a conservative default of 3 -- config.py itself is
+        NOT modified.
+
+    No Firestore schema, collection, field, or job-ID changes were
+    made anywhere in this file.
 """
 
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import sys
@@ -280,22 +330,35 @@ def cmd_enqueue_daily(args) -> dict:
     """
     Prepare DAILY_SYNC jobs for all ACTIVE students.
 
-    Flow:
+    Problem 2 fix -- read this before touching this function again:
 
-        ACTIVE students?
-              |
-              +-- NO --> STOP
-              |
-             YES
-              |
-              v
-        Probe ONE student
-              |
-              +-- unavailable --> store NOT_AVAILABLE
-              |                   STOP
-              |
-              +-- available ----> create jobs
-                                  for ALL students
+        SCCE's date selector can differ per student/section (e.g. two
+        students in different sections can legitimately see different
+        available dates). The old implementation probed exactly
+        students[0] and, if that ONE student came back unavailable,
+        wrote a GLOBAL daily_status/{date} = NOT_AVAILABLE document
+        and returned without creating a single job -- so a student
+        with an ordinary no-class day (e.g. hall ticket 501) silently
+        prevented every other student (e.g. 565, who DID have classes)
+        from ever being scraped for that date.
+
+        The probe is now purely informational:
+          - A positive result is still written to daily_status (this
+            is safe -- it is only ever additive, never used to skip).
+          - A negative result, or the probe call itself failing, is
+            logged and otherwise ignored: it is NOT written to
+            daily_status and it does NOT stop job creation.
+        DAILY_SYNC jobs are ALWAYS created for every active student
+        (idempotently -- create_job() no-ops if the job already
+        exists). Each student's own job discovers, when it actually
+        runs, whether SCCE has attendance for THAT student on this
+        date, via daily_sync.run_daily_sync()'s existing
+        Firestore-first check + scrape.
+
+        This also removes the old early-return that checked for a
+        pre-existing NOT_AVAILABLE status before even probing --
+        that early-return is exactly what let one bad probe result
+        poison every future enqueue run for that date too.
     """
 
     target_date = (
@@ -336,36 +399,7 @@ def cmd_enqueue_daily(args) -> dict:
     )
 
     # --------------------------------------------------------
-    # 2. Check whether date already has global status
-    # --------------------------------------------------------
-
-    existing_status = (
-        firestore_repo.get_daily_status(
-            target_date
-        )
-    )
-
-    if (
-        existing_status
-        and existing_status.get("status") == "NOT_AVAILABLE"
-    ):
-
-        logger.info(
-            "DATE_ALREADY_NOT_AVAILABLE date=%s",
-            target_date,
-        )
-
-        return {
-            "status": "SKIPPED_NOT_AVAILABLE",
-            "date": target_date,
-            "message": (
-                "Date was already confirmed unavailable "
-                "by the SCCE date selector."
-            ),
-        }
-
-    # --------------------------------------------------------
-    # 3. Pick one student for date probe
+    # 2. Informational probe (does NOT gate job creation)
     # --------------------------------------------------------
 
     probe_student = students[0]
@@ -382,68 +416,53 @@ def cmd_enqueue_daily(args) -> dict:
 
     try:
 
-        available = daily_sync.check_date_available(
+        probe_available = daily_sync.check_date_available(
             probe_hall_ticket,
             target_date,
         )
 
     except Exception as exc:
 
-        logger.exception(
-            "DATE_CHECK_FAILED date=%s",
+        logger.warning(
+            "DATE_PROBE_FAILED hall=%s date=%s error=%s "
+            "-- continuing, this does not block job creation",
+            probe_hall_ticket,
             target_date,
+            exc,
         )
 
-        return {
-            "status": "DATE_CHECK_FAILED",
-            "date": target_date,
-            "probe_student": probe_hall_ticket,
-            "error": str(exc),
-        }
+        probe_available = None
 
-    # --------------------------------------------------------
-    # 4. Date unavailable
-    # --------------------------------------------------------
-
-    if not available:
+    if probe_available is True:
 
         logger.info(
-            "DATE_NOT_AVAILABLE date=%s",
+            "DATE_AVAILABLE (probe) date=%s",
             target_date,
         )
 
         firestore_repo.set_daily_status(
             target_date,
-            "NOT_AVAILABLE",
+            "AVAILABLE",
             checkedBy=probe_hall_ticket,
         )
 
-        return {
-            "status": "SKIPPED_NOT_AVAILABLE",
-            "date": target_date,
-            "message": (
-                "Date is not offered by SCCE. "
-                "No students will be scraped."
-            ),
-        }
+    elif probe_available is False:
+
+        logger.info(
+            "DATE_NOT_AVAILABLE_FOR_PROBE "
+            "hall=%s date=%s -- per-student signal only, "
+            "other students still get their own job",
+            probe_hall_ticket,
+            target_date,
+        )
+
+        # Deliberately NOT calling
+        # firestore_repo.set_daily_status(target_date, "NOT_AVAILABLE", ...)
+        # here -- see Problem 2 above.
 
     # --------------------------------------------------------
-    # 5. Date available
-    # --------------------------------------------------------
-
-    logger.info(
-        "DATE_AVAILABLE date=%s",
-        target_date,
-    )
-
-    firestore_repo.set_daily_status(
-        target_date,
-        "AVAILABLE",
-        checkedBy=probe_hall_ticket,
-    )
-
-    # --------------------------------------------------------
-    # 6. Create jobs for ALL active students
+    # 3. Create jobs for ALL active students, regardless of the
+    #    probe outcome.
     # --------------------------------------------------------
 
     created = 0
@@ -520,65 +539,43 @@ def cmd_enqueue_daily(args) -> dict:
         "students": len(students),
         "created": created,
         "existing": existing,
+        "probe_student": probe_hall_ticket,
+        "probe_available": probe_available,
     }
 
 
 # ============================================================
-# QUEUE
+# SINGLE JOB DISPATCH (isolation boundary)
 # ============================================================
 
-def cmd_queue(args) -> dict:
+def _run_single_job(job: dict) -> dict:
     """
-    Process eligible jobs sequentially.
+    Process exactly one job and ALWAYS return a result dict --
+    never raise.
 
-    DAILY_SYNC:
-
-        1. Check global daily_status.
-        2. If NOT_AVAILABLE -> skip.
-        3. Otherwise call run_daily_sync().
-        4. run_daily_sync() checks Firestore attendance BEFORE
-           contacting SCCE.
-        5. Already scraped -> SUCCESS + skip.
-        6. Missing -> scrape.
-
-    This means one already-scraped student cannot cause
-    another student to be scraped repeatedly.
+    This is the isolation boundary required by Problem 1: whatever
+    goes wrong while processing one student's job (a bug, an
+    unexpected exception type, anything not already handled inside
+    daily_sync.run_daily_sync() / historical_sync.run_historical_sync()),
+    it is caught here, logged, and turned into a FAILED-shaped result
+    -- so it can never propagate up and stop the rest of the queue
+    from being processed.
     """
 
-    jobs = firestore_repo.query_pending_jobs(
-        job_type=args.type,
-        limit=args.limit,
+    job_id = job.get("id")
+    job_type = job.get("type")
+    hall_ticket = _normalize(
+        job.get("hallTicket")
     )
 
     logger.info(
-        "QUEUE_SCAN found=%d type=%s",
-        len(jobs),
-        args.type or "any",
+        "QUEUE_JOB job=%s type=%s hall=%s",
+        job_id,
+        job_type,
+        hall_ticket,
     )
 
-    results = []
-
-    skipped_not_available = 0
-    skipped_invalid = 0
-
-    # --------------------------------------------------------
-    # Process jobs sequentially
-    # --------------------------------------------------------
-
-    for job in jobs:
-
-        job_id = job.get("id")
-        job_type = job.get("type")
-        hall_ticket = _normalize(
-            job.get("hallTicket")
-        )
-
-        logger.info(
-            "QUEUE_JOB job=%s type=%s hall=%s",
-            job_id,
-            job_type,
-            hall_ticket,
-        )
+    try:
 
         # ====================================================
         # INITIAL SYNC
@@ -586,14 +583,10 @@ def cmd_queue(args) -> dict:
 
         if job_type == "INITIAL_SYNC":
 
-            result = historical_sync.run_historical_sync(
+            return historical_sync.run_historical_sync(
                 hall_ticket,
                 worker_id=config.WORKER_ID,
             )
-
-            results.append(result)
-
-            continue
 
         # ====================================================
         # DAILY SYNC
@@ -611,12 +604,24 @@ def cmd_queue(args) -> dict:
                     job_id,
                 )
 
-                skipped_invalid += 1
-
-                continue
+                return {
+                    "job_id": job_id,
+                    "hallTicket": hall_ticket,
+                    "status": "INVALID",
+                    "reason": "MISSING_DATE",
+                }
 
             # ------------------------------------------------
-            # Global date check
+            # Global date check.
+            #
+            # NOTE: as of the Problem 2 fix, cmd_enqueue_daily()
+            # no longer writes NOT_AVAILABLE from a single probe
+            # student, so this branch is now only ever reached
+            # for dates that were confirmed NOT_AVAILABLE some
+            # other, more trustworthy way (or by older data from
+            # before this fix). It is kept as-is deliberately: a
+            # cheap skip, never the source of a false verdict for
+            # jobs created going forward.
             # ------------------------------------------------
 
             daily_status = (
@@ -624,12 +629,6 @@ def cmd_queue(args) -> dict:
                     target_date
                 )
             )
-
-            # ------------------------------------------------
-            # Date confirmed unavailable
-            #
-            # Do not call run_daily_sync().
-            # ------------------------------------------------
 
             if (
                 daily_status
@@ -646,9 +645,13 @@ def cmd_queue(args) -> dict:
                     target_date,
                 )
 
-                skipped_not_available += 1
-
-                continue
+                return {
+                    "job_id": job_id,
+                    "hallTicket": hall_ticket,
+                    "date": target_date,
+                    "status": "SKIPPED",
+                    "reason": "DATE_NOT_AVAILABLE",
+                }
 
             # ------------------------------------------------
             # Date available / unknown
@@ -664,17 +667,17 @@ def cmd_queue(args) -> dict:
             # If no:
             #
             #   SCRAPE
+            #
+            # run_daily_sync() itself now catches its own
+            # scraper/Firestore failures and returns a FAILED
+            # result rather than raising (see daily_sync.py).
             # ------------------------------------------------
 
-            result = daily_sync.run_daily_sync(
+            return daily_sync.run_daily_sync(
                 hall_ticket,
                 target_date=target_date,
                 worker_id=config.WORKER_ID,
             )
-
-            results.append(result)
-
-            continue
 
         # ====================================================
         # UNKNOWN JOB TYPE
@@ -686,7 +689,147 @@ def cmd_queue(args) -> dict:
             job_type,
         )
 
-        skipped_invalid += 1
+        return {
+            "job_id": job_id,
+            "hallTicket": hall_ticket,
+            "status": "INVALID",
+            "reason": "UNKNOWN_JOB_TYPE",
+        }
+
+    except Exception as exc:
+
+        # ----------------------------------------------------
+        # Final isolation boundary. Belt-and-suspenders on top
+        # of daily_sync.run_daily_sync()'s own error handling:
+        # no matter what goes wrong with THIS one student's job,
+        # it must never take down the rest of the queue.
+        # ----------------------------------------------------
+
+        logger.exception(
+            "QUEUE_JOB_FAILED job=%s hall=%s type=%s",
+            job_id,
+            hall_ticket,
+            job_type,
+        )
+
+        return {
+            "job_id": job_id,
+            "hallTicket": hall_ticket,
+            "status": "FAILED",
+            "error": str(exc),
+        }
+
+
+# ============================================================
+# QUEUE
+# ============================================================
+
+def cmd_queue(args) -> dict:
+    """
+    Process eligible jobs with bounded concurrency, each fully
+    isolated from the others (Problem 1 + Problem 3 fix).
+
+    Every job is dispatched through _run_single_job(), which never
+    raises, and jobs run inside a small ThreadPoolExecutor so that:
+
+        - one student's failure cannot affect any other student
+          (each job's exceptions are contained within its own
+          try/except, and even within its own thread),
+        - SCCE request volume stays bounded no matter how many
+          students are registered (concurrency is capped, not
+          unlimited),
+        - existing Firestore checkpoints, deterministic job IDs,
+          and the Firestore-first "already scraped" check are all
+          preserved exactly as before -- nothing about *what* each
+          job does has changed, only that jobs run concurrently
+          (bounded) instead of one at a time, and that a failure
+          in one job can no longer abort the batch.
+
+    Concurrency is capped at config.MAX_CONCURRENT_SCRAPES when that
+    setting exists on the existing config module; otherwise a
+    conservative default of 3 is used. config.py itself is not
+    modified by this fix.
+    """
+
+    jobs = firestore_repo.query_pending_jobs(
+        job_type=args.type,
+        limit=args.limit,
+    )
+
+    logger.info(
+        "QUEUE_SCAN found=%d type=%s",
+        len(jobs),
+        args.type or "any",
+    )
+
+    max_workers = max(
+        1,
+        getattr(config, "MAX_CONCURRENT_SCRAPES", 3),
+    )
+
+    results = []
+
+    skipped_not_available = 0
+    skipped_invalid = 0
+
+    # --------------------------------------------------------
+    # Process jobs with bounded concurrency. Each job is fully
+    # isolated by _run_single_job(), which never raises.
+    # --------------------------------------------------------
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max_workers
+    ) as executor:
+
+        future_to_job = {
+            executor.submit(_run_single_job, job): job
+            for job in jobs
+        }
+
+        for future in concurrent.futures.as_completed(
+            future_to_job
+        ):
+
+            job = future_to_job[future]
+
+            try:
+
+                result = future.result()
+
+            except Exception as exc:
+
+                # Should be unreachable -- _run_single_job never
+                # raises -- but guarded anyway so a freak thread
+                # failure still cannot take down the batch.
+
+                logger.exception(
+                    "QUEUE_FUTURE_FAILED job=%s",
+                    job.get("id"),
+                )
+
+                result = {
+                    "job_id": job.get("id"),
+                    "hallTicket": _normalize(
+                        job.get("hallTicket")
+                    ),
+                    "status": "FAILED",
+                    "error": str(exc),
+                }
+
+            if (
+                result.get("status") == "SKIPPED"
+                and result.get("reason") == "DATE_NOT_AVAILABLE"
+            ):
+
+                skipped_not_available += 1
+                continue
+
+            if result.get("status") == "INVALID":
+
+                skipped_invalid += 1
+                continue
+
+            results.append(result)
 
     # ========================================================
     # RESULT COUNTS
@@ -827,8 +970,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_enqueue = sub.add_parser(
         "enqueue-daily",
         help=(
-            "Check date availability and create "
-            "DAILY_SYNC jobs"
+            "Probe date availability (informational) and create "
+            "DAILY_SYNC jobs for all active students"
         ),
     )
 
